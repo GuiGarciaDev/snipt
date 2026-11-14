@@ -266,6 +266,12 @@ fn main() {
             }
         }
 
+        // If "Start with Windows" is on, point it at this copy of the exe, so
+        // moving snipt.exe to another folder doesn't silently break autostart.
+        if autostart_enabled() {
+            set_autostart(true);
+        }
+
         tray(NIM_ADD, None);
         if first_run {
             let msg = format!("Snipt is running. Press {} to open it.", a.hotkey);

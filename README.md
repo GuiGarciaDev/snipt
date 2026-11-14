@@ -3,9 +3,33 @@
 A tiny Win+V-style popup for **your own** snippets: text, templates and links.
 Press a shortcut, type a few letters, hit Enter, and the snippet is pasted where you were typing.
 
-- **~210 KB** single `.exe`. No installer, no runtime, no web view.
+- **~310 KB** single `.exe`. No installer, no runtime, no web view. Download it and run it.
 - **~2.5 MB** private memory while running.
 - Pure Rust + Win32 + GDI, with a single dependency (`windows-sys`, plain API bindings). Icons come from the Segoe Fluent Icons font built into Windows.
+
+## Install
+
+1. Download `snipt.exe` from the **Releases** page of this repository.
+2. Put it in a permanent folder, for example `%LOCALAPPDATA%\Programs\Snipt\`.
+3. Double-click it. A tray icon appears, along with a tip showing the shortcut.
+
+That's it. Nothing else to install: the exe is fully standalone (the C runtime is linked in, so the Visual C++ Redistributable isn't needed). Your snippets are stored in `%APPDATA%\Snipt\snippets.txt`, which is created with a few examples on the first run.
+
+**Requirements:** Windows 10 or 11, 64-bit. Snipt runs as your normal user and needs no admin rights.
+
+**"Windows protected your PC"?** The exe isn't code-signed (certificates cost money, and this is a free tool), so Microsoft SmartScreen warns about it the first time you run a new download. Click **More info**, then **Run anyway**. If you prefer not to trust a prebuilt binary, [build it yourself](#build) from source; it takes about a minute.
+
+### Start with Windows
+
+Right-click the tray icon and check **Start with Windows**. Snipt then starts quietly in the tray each time you sign in. This uses your user's `Run` registry key, so no admin rights are needed, and you can also turn it off in Task Manager > Startup apps. If you later move `snipt.exe` to another folder, just run it once from the new place and the startup entry follows it.
+
+### Uninstall
+
+1. Uncheck **Start with Windows** in the tray menu (if you turned it on), then choose **Exit**.
+2. Delete `snipt.exe`.
+3. Optionally delete `%APPDATA%\Snipt` (your snippets).
+
+Snipt leaves nothing else behind.
 
 ## Usage
 
@@ -64,7 +88,16 @@ Best regards,
 cargo build --release
 ```
 
-The binary is `target/release/snipt.exe`. The release profile is tuned for size (`opt-level = "z"`, LTO, `panic = "abort"`, stripped).
+You need [Rust](https://rustup.rs) with the default MSVC toolchain (it asks to install the Visual Studio Build Tools if they're missing).
+
+The binary is `target/release/snipt.exe`. The release profile is tuned for size (`opt-level = "z"`, LTO, `panic = "abort"`, stripped), and `.cargo/config.toml` links the C runtime statically (`+crt-static`), so the exe only depends on DLLs that ship with Windows.
+
+### Publishing a release
+
+1. Bump `version` in `Cargo.toml`, then run `cargo build --release`.
+2. On GitHub, create a release with a tag like `v0.1.0`.
+3. Attach `target/release/snipt.exe` to the release.
+4. Optionally, include its SHA-256 hash so people can check the download. You get it with `certutil -hashfile target\release\snipt.exe SHA256`.
 
 ## Known limitations
 
