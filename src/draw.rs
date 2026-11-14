@@ -4,6 +4,7 @@
 //! While painting, every clickable area is recorded in `App::regions`, so hit
 //! testing always matches exactly what is on screen.
 
+use crate::anim::{CONFIRM_MS, SELECT_MS, Tween};
 use crate::snippets::{Kind, Snippet};
 use crate::{Action, App, Mode, PLACEHOLDERS};
 use std::mem::zeroed;
@@ -31,6 +32,23 @@ pub const MUTED: COLORREF = rgb(145, 145, 156);
 pub const FAINT: COLORREF = rgb(98, 98, 108);
 pub const DANGER: COLORREF = rgb(240, 100, 110);
 pub const DANGER_BG: COLORREF = rgb(44, 21, 25);
+
+/// Blends `a` over `b`; `t` = 0 gives `b`, 255 gives `a`.
+pub fn mix(a: COLORREF, b: COLORREF, t: u32) -> COLORREF {
+    let t = t.min(255);
+    let ch = |c: COLORREF, s: u32| (c >> s) & 0xff;
+    let m = |s| (ch(a, s) * t + ch(b, s) * (255 - t)) / 255;
+    m(0) | m(8) << 8 | m(16) << 16
+}
+
+/// Hover colour for `act`, fading from `base` to `to` as the hover animates in.
+fn hv(a: &App, act: Action, base: COLORREF, to: COLORREF) -> COLORREF {
+    if a.hover == Some(act) {
+        mix(to, base, (a.anim.hover.value() * 255.0).round() as u32)
+    } else {
+        base
+    }
+}
 
 // Segoe Fluent Icons / Segoe MDL2 Assets code points (built into Windows).
 const IC_SEARCH: u32 = 0xE721;
@@ -278,7 +296,10 @@ unsafe fn paint_list(a: &mut App, dc: HDC) {
     let cx = (tx + qw).min(right);
     let ch = a.s(16);
     let cy = field.top + (field.bottom - field.top - ch) / 2;
-    fill(dc, RECT { left: cx, top: cy, right: cx + a.s(1).max(1) + 1, bottom: cy + ch }, ACCENT);
+    a.caret_rect = RECT { left: cx, top: cy, right: cx + a.s(1).max(1) + 1, bottom: cy + ch };
+    if a.caret_on {
+        fill(dc, a.caret_rect, ACCENT);
+    }
 
     // Rows
     if a.hits.is_empty() {
@@ -290,6 +311,32 @@ unsafe fn paint_list(a: &mut App, dc: HDC) {
         let r = a.r(PAD, LIST_TOP, WIDTH - PAD, LIST_TOP + a.rows as i32 * ROW_H);
         text(dc, msg, r, f.small, MUTED, DT_CENTER);
     }
+
+    // Selection highlight, drawn once and gliding between rows.
+    if a.sel < a.hits.len() && a.sel >= a.top && a.sel < a.top + a.rows {
+        let target = ((a.sel - a.top) as i32 * ROW_H) as f32;
+        if a.anim.snap_select {
+            a.anim.select_y = Tween::at(target);
+            a.anim.snap_select = false;
+        } else if a.anim.select_y.target() != target {
+            let ms = a.anim.ms(SELECT_MS);
+            a.anim.select_y.go(target, ms);
+            crate::animate();
+        }
+        let y = LIST_TOP + a.anim.select_y.value().round() as i32;
+        rrect(dc, a.r(PAD, y, WIDTH - PAD, y + ROW_H), a.s(8), SELECTED, SELECTED);
+        fill(dc, a.r(PAD, y + 11, PAD + 2, y + ROW_H - 11), ACCENT);
+    }
+
+    // Delete confirmation fades in when it appears.
+    if a.confirm != a.anim.confirm_for {
+        a.anim.confirm_for = a.confirm;
+        if a.confirm.is_some() {
+            a.anim.confirm = Tween::from_to(0.0, 1.0, a.anim.ms(CONFIRM_MS));
+            crate::animate();
+        }
+    }
+
     for row in 0..a.rows {
         let idx = a.top + row;
         let Some(&si) = a.hits.get(idx) else { break };
@@ -309,13 +356,13 @@ unsafe fn paint_list(a: &mut App, dc: HDC) {
     // Gear (bottom-right) opens / closes management.
     let (gt, gb) = mid(22);
     let gear = a.r(WIDTH - PAD - 26, gt, WIDTH - PAD - 4, gb);
-    let hover = a.hover == Some(Action::Gear);
     if manage {
         rrect(dc, gear, a.s(6), SELECTED, SELECTED);
-    } else if hover {
-        rrect(dc, gear, a.s(6), HOVER, HOVER);
+    } else if a.hover == Some(Action::Gear) {
+        let bg = hv(a, Action::Gear, BG, HOVER);
+        rrect(dc, gear, a.s(6), bg, bg);
     }
-    let gc = if manage { ACCENT_TEXT } else if hover { TEXT } else { MUTED };
+    let gc = if manage { ACCENT_TEXT } else { hv(a, Action::Gear, MUTED, TEXT) };
     glyph(dc, IC_SETTINGS, gear, a.fonts.icon_small, gc);
     a.regions.push((gear, Action::Gear));
 
@@ -338,8 +385,7 @@ unsafe fn paint_list(a: &mut App, dc: HDC) {
         let w = a.s(8) + a.s(14) + a.s(4) + text_w(dc, label, f.tiny) + a.s(8);
         let (bt, bb) = mid(22);
         let r = RECT { left: x - a.s(4), top: a.s(bt), right: x - a.s(4) + w, bottom: a.s(bb) };
-        let hover = a.hover == Some(Action::New);
-        rrect(dc, r, a.s(6), if hover { HOVER } else { BG }, if hover { HOVER } else { BORDER });
+        rrect(dc, r, a.s(6), hv(a, Action::New, BG, HOVER), hv(a, Action::New, BORDER, HOVER));
         glyph(dc, IC_ADD, RECT { left: r.left + a.s(8), right: r.left + a.s(22), ..r }, a.fonts.icon_small, ACCENT_TEXT);
         text(dc, label, RECT { left: r.left + a.s(26), ..r }, a.fonts.tiny, ACCENT_TEXT, 0);
         a.regions.push((r, Action::New));
@@ -381,11 +427,7 @@ unsafe fn paint_row(a: &mut App, dc: HDC, y0: i32, idx: usize, si: usize, manage
     let s = &a.all[si];
     let f = &a.fonts;
     let r = a.r(PAD, y0, WIDTH - PAD, y0 + ROW_H);
-    let selected = idx == a.sel;
-    if selected {
-        rrect(dc, r, a.s(8), SELECTED, SELECTED);
-        fill(dc, a.r(PAD, y0 + 11, PAD + 2, y0 + ROW_H - 11), ACCENT);
-    }
+    let selected = idx == a.sel; // highlight itself is drawn in paint_list
     a.regions.push((r, Action::Row(idx)));
 
     glyph(dc, icon_for(s), a.r(PAD + 9, y0, PAD + 31, y0 + ROW_H), f.icon, if selected { ACCENT_TEXT } else { MUTED });
@@ -409,16 +451,12 @@ unsafe fn paint_row(a: &mut App, dc: HDC, y0: i32, idx: usize, si: usize, manage
         let mut x = badge.left - a.s(6);
         for (icon, act) in [(IC_DELETE, Action::DeleteRow(si)), (IC_EDIT, Action::EditRow(si))] {
             let b = RECT { left: x - a.s(24), top: a.s(y0 + 9), right: x, bottom: a.s(y0 + ROW_H - 9) };
-            let hover = a.hover == Some(act);
-            if hover {
-                let hb = if icon == IC_DELETE { DANGER_BG } else { HOVER };
-                rrect(dc, b, a.s(6), hb, hb);
+            let danger = icon == IC_DELETE;
+            if a.hover == Some(act) {
+                let bg = hv(a, act, SELECTED, if danger { DANGER_BG } else { HOVER });
+                rrect(dc, b, a.s(6), bg, bg);
             }
-            let c = match (hover, icon == IC_DELETE) {
-                (true, true) => DANGER,
-                (true, false) => TEXT,
-                _ => MUTED,
-            };
+            let c = hv(a, act, MUTED, if danger { DANGER } else { TEXT });
             glyph(dc, icon, b, f.icon_small, c);
             a.regions.push((b, act));
             x = b.left - a.s(2);
@@ -433,26 +471,28 @@ unsafe fn paint_row(a: &mut App, dc: HDC, y0: i32, idx: usize, si: usize, manage
 
 unsafe fn paint_confirm_row(a: &mut App, dc: HDC, y0: i32, si: usize) {
     let f = &a.fonts;
+    // Fades in from the selected-row colours.
+    let t = (a.anim.confirm.value() * 255.0).round() as u32;
+    let k = |c: COLORREF| mix(c, SELECTED, t);
     let r = a.r(PAD, y0, WIDTH - PAD, y0 + ROW_H);
-    rrect(dc, r, a.s(8), DANGER_BG, rgb(74, 32, 38));
-    glyph(dc, IC_DELETE, a.r(PAD + 9, y0, PAD + 31, y0 + ROW_H), f.icon_small, DANGER);
+    rrect(dc, r, a.s(8), k(DANGER_BG), k(rgb(74, 32, 38)));
+    glyph(dc, IC_DELETE, a.r(PAD + 9, y0, PAD + 31, y0 + ROW_H), f.icon_small, k(DANGER));
 
     let bt = a.s(y0 + (ROW_H - 24) / 2);
     let del = RECT { left: r.right - a.s(10 + 62), top: bt, right: r.right - a.s(10), bottom: bt + a.s(24) };
     let cancel = RECT { left: del.left - a.s(6 + 62), right: del.left - a.s(6), ..del };
-    let hd = a.hover == Some(Action::ConfirmDelete);
-    let hc = a.hover == Some(Action::CancelDelete);
-    rrect(dc, del, a.s(6), if hd { rgb(220, 70, 82) } else { rgb(196, 58, 70) }, rgb(196, 58, 70));
-    text(dc, "Delete", del, f.tiny, rgb(255, 255, 255), DT_CENTER);
-    rrect(dc, cancel, a.s(6), if hc { HOVER } else { SURFACE }, BORDER);
-    text(dc, "Cancel", cancel, f.tiny, TEXT, DT_CENTER);
+    let red = rgb(196, 58, 70);
+    rrect(dc, del, a.s(6), k(hv(a, Action::ConfirmDelete, red, rgb(220, 70, 82))), k(red));
+    text(dc, "Delete", del, f.tiny, k(rgb(255, 255, 255)), DT_CENTER);
+    rrect(dc, cancel, a.s(6), k(hv(a, Action::CancelDelete, SURFACE, HOVER)), k(BORDER));
+    text(dc, "Cancel", cancel, f.tiny, k(TEXT), DT_CENTER);
     a.regions.push((r, Action::None));
     a.regions.push((del, Action::ConfirmDelete));
     a.regions.push((cancel, Action::CancelDelete));
 
     let msg = format!("Delete \u{201C}{}\u{201D}?", a.all[si].name);
     let tr = RECT { left: a.s(PAD + 38), top: r.top, right: cancel.left - a.s(10), bottom: r.bottom };
-    text(dc, &msg, tr, f.name, TEXT, 0);
+    text(dc, &msg, tr, f.name, k(TEXT), 0);
 }
 
 // ---------------------------------------------------------------- editor
@@ -483,13 +523,14 @@ unsafe fn paint_editor(a: &mut App, dc: HDC) {
         let l = x0 + 2 + seg_w * i as i32;
         let seg = a.r(l, E_TYPE.0 + 2, l + seg_w, E_TYPE.1 - 2);
         let on = a.editor.kind == k;
-        let hover = a.hover == Some(Action::SetKind(k));
+        let act = Action::SetKind(k);
         if on {
             rrect(dc, seg, a.s(6), SELECTED, rgb(74, 52, 140));
-        } else if hover {
-            rrect(dc, seg, a.s(6), HOVER, HOVER);
+        } else if a.hover == Some(act) {
+            let bg = hv(a, act, SURFACE, HOVER);
+            rrect(dc, seg, a.s(6), bg, bg);
         }
-        let c = if on { ACCENT_TEXT } else if hover { TEXT } else { MUTED };
+        let c = if on { ACCENT_TEXT } else { hv(a, act, MUTED, TEXT) };
         let name = match k {
             Kind::Url => "URL",
             Kind::Template => "Template",
@@ -514,8 +555,7 @@ unsafe fn paint_editor(a: &mut App, dc: HDC) {
                 for (i, ph) in PLACEHOLDERS.iter().enumerate() {
                     let w = text_w(dc, ph, f.tiny) + a.s(10);
                     let chip = RECT { left: x, top: hint.top + a.s(1), right: x + w, bottom: hint.bottom - a.s(1) };
-                    let hover = a.hover == Some(Action::Insert(i));
-                    rrect(dc, chip, a.s(4), if hover { HOVER } else { SURFACE }, BORDER);
+                    rrect(dc, chip, a.s(4), hv(a, Action::Insert(i), SURFACE, HOVER), BORDER);
                     text(dc, ph, chip, f.tiny, ACCENT_TEXT, DT_CENTER);
                     a.regions.push((chip, Action::Insert(i)));
                     x = chip.right + a.s(5);
@@ -531,11 +571,10 @@ unsafe fn paint_editor(a: &mut App, dc: HDC) {
     let (bt, bb) = (E_FOOT + 9, E_FOOT + 35);
     let save = a.r(x1 - 76, bt, x1, bb);
     let cancel = a.r(x1 - 76 - 8 - 76, bt, x1 - 76 - 8, bb);
-    let hs = a.hover == Some(Action::Save);
-    rrect(dc, save, a.s(6), if hs { ACCENT_HOVER } else { ACCENT }, if hs { ACCENT_HOVER } else { ACCENT });
+    let save_bg = hv(a, Action::Save, ACCENT, ACCENT_HOVER);
+    rrect(dc, save, a.s(6), save_bg, save_bg);
     text(dc, "Save", save, f.small, rgb(255, 255, 255), DT_CENTER);
-    let hc = a.hover == Some(Action::Cancel);
-    rrect(dc, cancel, a.s(6), if hc { HOVER } else { SURFACE }, BORDER);
+    rrect(dc, cancel, a.s(6), hv(a, Action::Cancel, SURFACE, HOVER), BORDER);
     text(dc, "Cancel", cancel, f.small, TEXT, DT_CENTER);
     a.regions.push((save, Action::Save));
     a.regions.push((cancel, Action::Cancel));
@@ -549,13 +588,13 @@ unsafe fn paint_editor(a: &mut App, dc: HDC) {
         let label = if confirm { "Click again to delete" } else { "Delete" };
         let w = a.s(28) + text_w(dc, label, f.small) + a.s(10);
         let del = RECT { left: a.s(x0), top: save.top, right: a.s(x0) + w, bottom: save.bottom };
-        let hover = a.hover == Some(Action::EditorDelete);
         if confirm {
             rrect(dc, del, a.s(6), DANGER_BG, rgb(110, 40, 48));
-        } else if hover {
-            rrect(dc, del, a.s(6), DANGER_BG, DANGER_BG);
+        } else if a.hover == Some(Action::EditorDelete) {
+            let bg = hv(a, Action::EditorDelete, BG, DANGER_BG);
+            rrect(dc, del, a.s(6), bg, bg);
         }
-        let c = if confirm || hover { DANGER } else { MUTED };
+        let c = if confirm { DANGER } else { hv(a, Action::EditorDelete, MUTED, DANGER) };
         glyph(dc, IC_DELETE, RECT { left: del.left + a.s(8), right: del.left + a.s(24), ..del }, f.icon_small, c);
         text(dc, label, RECT { left: del.left + a.s(28), ..del }, f.small, c, 0);
         a.regions.push((del, Action::EditorDelete));

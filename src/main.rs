@@ -4,6 +4,7 @@
 #![windows_subsystem = "windows"]
 #![allow(unsafe_op_in_unsafe_fn)]
 
+mod anim;
 mod draw;
 mod paste;
 mod snippets;
@@ -38,6 +39,8 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_SHOW: u32 = WM_APP + 2;
 const HOTKEY_ID: i32 = 1;
 const TIMER_RESTORE: usize = 1;
+const TIMER_ANIM: usize = 2;
+const TIMER_BLINK: usize = 3;
 
 const ID_OPEN: usize = 100;
 const ID_MANAGE: usize = 101;
@@ -121,6 +124,10 @@ pub struct App {
     hotkey: &'static str,
     taskbar_created: u32,
     icon: HICON,
+    pub anim: anim::Anim,
+    /// Search caret: shown or hidden (blink phase), and where it was last drawn.
+    pub caret_on: bool,
+    pub caret_rect: RECT,
 }
 
 impl App {
@@ -206,6 +213,9 @@ fn main() {
             hotkey: "no hotkey (use the tray icon)",
             taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
             icon: draw::make_icon(text_face),
+            anim: anim::Anim::new(),
+            caret_on: true,
+            caret_rect: RECT { left: 0, top: 0, right: 0, bottom: 0 },
         }));
 
         let hwnd = CreateWindowExW(
@@ -283,7 +293,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     let a = app();
     match msg {
         WM_HOTKEY => {
-            if IsWindowVisible(hwnd) == 0 {
+            if !shown() {
                 show(Mode::Browse);
             } else if a.mode == Mode::Edit {
                 force_foreground(hwnd); // never throw away an edit in progress
@@ -335,14 +345,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if (wp & 0xffff) as u32 == WA_INACTIVE {
                 // Clicking elsewhere closes the popup, like Win+V. The editor
                 // stays open so you can copy text from other apps into it.
-                if a.mode != Mode::Edit {
-                    ShowWindow(hwnd, SW_HIDE);
+                if a.mode != Mode::Edit && !a.anim.closing {
+                    hide(false); // focus already went where you clicked
                 }
             } else if a.mode == Mode::Edit {
                 SetFocus(if a.last_focus.is_null() { a.title_edit } else { a.last_focus });
             }
         }
-        WM_KEYDOWN => on_key(wp as u16),
+        WM_KEYDOWN => {
+            restart_blink();
+            on_key(wp as u16)
+        }
         WM_CHAR if a.mode != Mode::Edit => {
             let c = wp as u32;
             if c >= 0x20 && c != 0x7f && GetKeyState(VK_CONTROL as i32) >= 0 {
@@ -358,6 +371,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             TrackMouseEvent(&mut tme);
             let act = hit(lp);
             let mut dirty = act != a.hover;
+            if dirty && !matches!(act, None | Some(Action::Row(_)) | Some(Action::None)) {
+                a.anim.hover = anim::Tween::from_to(0.0, 1.0, a.anim.ms(anim::HOVER_MS));
+                animate();
+            }
             a.hover = act;
             if let Some(Action::Row(i)) = act {
                 if i != a.sel && a.confirm.is_none() {
@@ -386,6 +403,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             a.sel = a.sel.clamp(a.top, (a.top + a.rows - 1).min(a.hits.len().saturating_sub(1)));
             redraw();
         }
+        WM_TIMER if wp == TIMER_ANIM => tick(),
+        WM_TIMER if wp == TIMER_BLINK => {
+            if !shown() || a.mode == Mode::Edit {
+                stop_blink();
+            } else {
+                a.caret_on = !a.caret_on;
+                InvalidateRect(hwnd, &a.caret_rect, 0); // just the caret's pixels
+            }
+        }
         WM_TIMER if wp == TIMER_RESTORE => {
             KillTimer(hwnd, TIMER_RESTORE);
             if let Some(text) = a.restore.take() {
@@ -395,7 +421,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_DPICHANGED => {
             set_dpi((wp & 0xffff) as u32);
             let r = &*(lp as *const RECT);
-            SetWindowPos(hwnd, null_mut(), r.left, r.top, a.s(WIDTH), a.s(height()), SWP_NOZORDER | SWP_NOACTIVATE);
+            a.anim.height = anim::Tween::at(height() as f32);
+            a.anim.applied_h = a.s(height());
+            SetWindowPos(hwnd, null_mut(), r.left, r.top, a.s(WIDTH), a.anim.applied_h, SWP_NOZORDER | SWP_NOACTIVATE);
             layout_editor();
         }
         WM_ERASEBKGND => return 1,
@@ -474,9 +502,10 @@ unsafe fn click(act: Action) {
 
 unsafe fn show(mode: Mode) {
     let a = app();
-    if IsWindowVisible(a.hwnd) != 0 && a.mode == Mode::Edit {
+    if shown() && a.mode == Mode::Edit {
         return force_foreground(a.hwnd);
     }
+    finish_close(); // reopened mid fade-out: start fresh
     let fg = GetForegroundWindow();
     a.prev = if fg == a.hwnd { null_mut() } else { fg };
     a.all = snippets::load(); // tiny file; reloading picks up outside edits
@@ -502,9 +531,137 @@ unsafe fn show(mode: Mode) {
     let y = y.clamp(work.top + m, (work.bottom - h - m).max(work.top));
     let x = anchor.x.clamp(work.left + m, (work.right - w - m).max(work.left));
 
-    SetWindowPos(a.hwnd, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
+    a.anim.enabled = anim::system_enabled();
+    a.anim.height = anim::Tween::at(height() as f32);
+    a.anim.applied_h = h;
+    a.anim.base_y = y;
+    let mut start_y = y;
+    if a.anim.enabled {
+        // Fade in + short upward slide. The window is layered (translucent)
+        // only for these ~110 ms; `end_open` turns it back into a normal one.
+        let ex = GetWindowLongPtrW(a.hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(a.hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED as isize);
+        SetLayeredWindowAttributes(a.hwnd, 0, 0, LWA_ALPHA);
+        a.anim.layered = true;
+        a.anim.open = anim::Tween::from_to(0.0, 1.0, anim::OPEN_MS);
+        start_y = y + a.s(anim::SLIDE);
+    }
+    SetWindowPos(a.hwnd, HWND_TOPMOST, x, start_y, w, h, SWP_SHOWWINDOW);
     force_foreground(a.hwnd);
     redraw();
+    if a.anim.layered {
+        animate();
+    }
+    restart_blink();
+}
+
+/// Shows the search caret and (re)starts its blink at the Windows blink rate,
+/// so it stays solid while you type. No timer when blinking is turned off.
+unsafe fn restart_blink() {
+    let a = app();
+    if !a.caret_on {
+        a.caret_on = true;
+        InvalidateRect(a.hwnd, &a.caret_rect, 0);
+    }
+    let ms = GetCaretBlinkTime();
+    if a.mode != Mode::Edit && ms != 0 && ms != u32::MAX && shown() {
+        SetTimer(a.hwnd, TIMER_BLINK, ms, None);
+    } else {
+        KillTimer(a.hwnd, TIMER_BLINK);
+    }
+}
+
+unsafe fn stop_blink() {
+    let a = app();
+    KillTimer(a.hwnd, TIMER_BLINK);
+    a.caret_on = true;
+}
+
+// ---------------------------------------------------------------- animation
+
+/// Starts the animation timer if it isn't running.
+pub fn animate() {
+    let a = app();
+    if !a.anim.running {
+        a.anim.running = true;
+        unsafe { SetTimer(a.hwnd, TIMER_ANIM, 10, None) };
+    }
+}
+
+/// One animation frame (~64 per second). Stops the timer when all is still.
+unsafe fn tick() {
+    let a = app();
+    let mut active = false;
+
+    if a.anim.closing {
+        let t = a.anim.close.value();
+        SetLayeredWindowAttributes(a.hwnd, 0, (t * 255.0).round() as u8, LWA_ALPHA);
+        let dy = ((1.0 - t) * a.s(anim::CLOSE_SLIDE) as f32).round() as i32;
+        let mut r: RECT = zeroed();
+        GetWindowRect(a.hwnd, &mut r);
+        SetWindowPos(a.hwnd, null_mut(), r.left, a.anim.base_y + dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        if a.anim.close.done() {
+            finish_close();
+        } else {
+            active = true;
+        }
+    }
+
+    if a.anim.layered {
+        let t = a.anim.open.value();
+        SetLayeredWindowAttributes(a.hwnd, 0, (t * 255.0).round() as u8, LWA_ALPHA);
+        let dy = ((1.0 - t) * a.s(anim::SLIDE) as f32).round() as i32;
+        let mut r: RECT = zeroed();
+        GetWindowRect(a.hwnd, &mut r);
+        SetWindowPos(a.hwnd, null_mut(), r.left, a.anim.base_y + dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        if a.anim.open.done() {
+            end_open();
+        } else {
+            active = true;
+        }
+    }
+
+    apply_height();
+    active |= !a.anim.height.done();
+
+    let painting = a.anim.painting();
+    if painting || a.anim.repaint {
+        redraw();
+    }
+    a.anim.repaint = painting; // draws the final frame on the next tick
+    active |= painting;
+
+    if !active && !a.anim.repaint {
+        KillTimer(a.hwnd, TIMER_ANIM);
+        a.anim.running = false;
+    }
+}
+
+/// Ends the fade-in: fully opaque, final position, normal (non-layered) window.
+unsafe fn end_open() {
+    let a = app();
+    if !a.anim.layered {
+        return;
+    }
+    a.anim.layered = false;
+    a.anim.open = anim::Tween::at(1.0);
+    let mut r: RECT = zeroed();
+    GetWindowRect(a.hwnd, &mut r);
+    SetWindowPos(a.hwnd, null_mut(), r.left, a.anim.base_y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    SetLayeredWindowAttributes(a.hwnd, 0, 255, LWA_ALPHA);
+    let ex = GetWindowLongPtrW(a.hwnd, GWL_EXSTYLE);
+    SetWindowLongPtrW(a.hwnd, GWL_EXSTYLE, ex & !(WS_EX_LAYERED as isize));
+    RedrawWindow(a.hwnd, null(), null_mut(), RDW_ERASE | RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
+}
+
+/// Applies the animated window height (only when it changed by a pixel).
+unsafe fn apply_height() {
+    let a = app();
+    let h = a.s(a.anim.height.value().round() as i32);
+    if h != a.anim.applied_h {
+        a.anim.applied_h = h;
+        SetWindowPos(a.hwnd, null_mut(), 0, 0, a.s(WIDTH), h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
 }
 
 unsafe fn work_area(p: POINT) -> RECT {
@@ -530,7 +687,15 @@ unsafe fn resize() {
     let work = work_area(POINT { x: r.left, y: r.top });
     let h = a.s(height());
     let y = r.top.min(work.bottom - h - a.s(8)).max(work.top);
-    SetWindowPos(a.hwnd, null_mut(), r.left, y, a.s(WIDTH), h, SWP_NOZORDER | SWP_NOACTIVATE);
+    if y != r.top {
+        SetWindowPos(a.hwnd, null_mut(), r.left, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        a.anim.base_y = y;
+    }
+    // Ease the height instead of jumping (list <-> editor, add / delete).
+    let ms = a.anim.ms(anim::HEIGHT_MS);
+    a.anim.height.go(height() as f32, ms);
+    apply_height();
+    animate();
     redraw();
 }
 
@@ -566,12 +731,54 @@ unsafe fn force_foreground(h: HWND) {
     }
 }
 
+/// Visible and not on its way out.
+fn shown() -> bool {
+    let a = app();
+    unsafe { IsWindowVisible(a.hwnd) != 0 && !a.anim.closing }
+}
+
+/// Closes the popup. Focus goes back to your app right away, so pasting is
+/// never delayed; the window then fades out and drops a few pixels (~90 ms),
+/// click-through, on its own.
 unsafe fn hide(give_back_focus: bool) {
     let a = app();
-    ShowWindow(a.hwnd, SW_HIDE);
+    if !shown() {
+        return;
+    }
+    stop_blink();
+    if a.anim.enabled {
+        // Continue from the current opacity if it was still fading in.
+        let from = if a.anim.layered { a.anim.open.value() } else { 1.0 };
+        a.anim.layered = false;
+        a.anim.open = anim::Tween::at(1.0);
+        let ex = GetWindowLongPtrW(a.hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(a.hwnd, GWL_EXSTYLE, ex | (WS_EX_LAYERED | WS_EX_TRANSPARENT) as isize);
+        SetLayeredWindowAttributes(a.hwnd, 0, (from * 255.0).round() as u8, LWA_ALPHA);
+        let mut r: RECT = zeroed();
+        GetWindowRect(a.hwnd, &mut r);
+        a.anim.base_y = r.top;
+        a.anim.close = anim::Tween::from_to(from, 0.0, anim::CLOSE_MS);
+        a.anim.closing = true;
+        animate();
+    } else {
+        end_open();
+        ShowWindow(a.hwnd, SW_HIDE);
+    }
     if give_back_focus && !a.prev.is_null() && IsWindow(a.prev) != 0 {
         SetForegroundWindow(a.prev);
     }
+}
+
+/// Ends the fade-out: hidden, back in place, a normal window again.
+unsafe fn finish_close() {
+    let a = app();
+    if !a.anim.closing {
+        return;
+    }
+    a.anim.closing = false;
+    ShowWindow(a.hwnd, SW_HIDE);
+    let ex = GetWindowLongPtrW(a.hwnd, GWL_EXSTYLE);
+    SetWindowLongPtrW(a.hwnd, GWL_EXSTYLE, ex & !((WS_EX_LAYERED | WS_EX_TRANSPARENT) as isize));
 }
 
 // ---------------------------------------------------------------- paste
@@ -693,6 +900,7 @@ fn refilter() {
     a.hits = snippets::search(&a.all, &a.query);
     a.sel = 0;
     a.top = 0;
+    a.anim.snap_select = true; // new results: jump, don't glide
     redraw();
 }
 
@@ -735,8 +943,10 @@ unsafe fn close_editor() {
     a.mode = a.editor.back;
     a.last_focus = null_mut();
     a.hover = None;
+    a.anim.snap_select = true;
     SetFocus(a.hwnd);
     resize();
+    restart_blink();
 }
 
 /// Places the text boxes inside the fields drawn by `draw::paint_editor`.
@@ -863,6 +1073,7 @@ unsafe fn delete(si: usize) {
     a.hits = snippets::search(&a.all, &a.query);
     a.sel = keep.min(a.hits.len().saturating_sub(1));
     a.top = a.top.min(a.hits.len().saturating_sub(1));
+    a.anim.snap_select = true;
     resize();
     scroll_into_view();
 }

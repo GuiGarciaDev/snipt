@@ -3,7 +3,7 @@
 A tiny Win+V-style popup for **your own** snippets: text, templates and links.
 Press a shortcut, type a few letters, hit Enter, and the snippet is pasted where you were typing.
 
-- **200 KB** single `.exe`. No installer, no runtime, no web view.
+- **~210 KB** single `.exe`. No installer, no runtime, no web view.
 - **~2.5 MB** private memory while running.
 - Pure Rust + Win32 + GDI, with a single dependency (`windows-sys`, plain API bindings). Icons come from the Segoe Fluent Icons font built into Windows.
 
@@ -55,6 +55,8 @@ Best regards,
 3. On Enter, Snipt gives focus back to that window, puts the snippet on the clipboard, sends `Ctrl+V` with `SendInput`, and moves the cursor for `{cursor}`.
 4. 500 ms later your previous clipboard text is restored. Snippets are marked with `ExcludeClipboardContentFromMonitorProcessing`, so they don't fill up your Win+V history.
 5. The editor uses native `EDIT` controls, styled dark, so undo, selection, IME and paste work as usual.
+6. Animations (fade/slide on open and close, gliding selection, height changes, hover and delete-confirm fades) are short eased tweens driven by one timer. The timer runs only while something moves (~100 ms), so idle CPU stays at zero. They follow the Windows "Animation effects" setting. Pasting is never delayed: focus goes back to your app first, then the popup fades out on its own.
+7. The search caret blinks at your Windows cursor blink rate (solid while you type) and repaints only its own pixels, about two tiny repaints a second while the popup is open.
 
 ## Build
 
