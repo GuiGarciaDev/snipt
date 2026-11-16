@@ -7,6 +7,8 @@ Press a shortcut, type a few letters, hit Enter, and the snippet is pasted where
 - **~2.5 MB** private memory while running.
 - Pure Rust + Win32 + GDI, with a single dependency (`windows-sys`, plain API bindings). Icons come from the Segoe Fluent Icons font built into Windows.
 
+<img width="447" height="209" alt="image" src="https://github.com/user-attachments/assets/54474855-f6ac-4680-b55a-2314ceb140d4" />
+
 ## Install
 
 1. Download `snipt.exe` from the **Releases** page of this repository.
@@ -24,6 +26,9 @@ That's it. Nothing else to install: the exe is fully standalone (the C runtime i
 ### Start with Windows
 
 Right-click the tray icon and check **Start with Windows**. Snipt then starts quietly in the tray each time you sign in. This uses your user's `Run` registry key, so no admin rights are needed, and you can also turn it off in Task Manager > Startup apps. If you later move `snipt.exe` to another folder, just run it once from the new place and the startup entry follows it.
+
+<img width="316" height="168" alt="image" src="https://github.com/user-attachments/assets/81503209-2223-41e5-945a-188bf379b114" />
+
 
 ### Uninstall
 
@@ -61,6 +66,11 @@ Click the **gear** in the bottom-right corner to switch to manage mode:
 - **Del** or the trash icon deletes a snippet after an inline confirmation.
 - **Ctrl+P** or the pin icon pins or unpins it.
 - **Esc** or the gear goes back to normal mode.
+
+<img width="435" height="370" alt="image" src="https://github.com/user-attachments/assets/8d13fa6d-1e77-4080-8222-79b10322658a" />
+<img width="435" height="200" alt="image" src="https://github.com/user-attachments/assets/0d57b1cf-351e-4e33-ae12-179c6cd422ba" />
+<img width="441" height="205" alt="image" src="https://github.com/user-attachments/assets/5836d416-54d5-466c-b849-05e21b982a87" />
+\n
 
 The editor has a title, a type (URL, Template or Text) and the content. Template placeholders can be inserted with one click. URLs are validated before saving. The **Pin** toggle next to the type keeps the snippet at the top. Shortcuts in the editor: `Ctrl+Enter` saves, `Tab` switches fields, `Ctrl+T` changes the type, `Ctrl+P` pins, and `Esc` cancels. The editor stays open if you switch to another app, so you can copy text in from elsewhere.
 
