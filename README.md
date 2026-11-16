@@ -21,6 +21,11 @@
   <img width="447" alt="The Snipt popup: a search field, two pinned links and a template, with keyboard hints in the footer" src="https://github.com/user-attachments/assets/54474855-f6ac-4680-b55a-2314ceb140d4">
 </p>
 
+<p align="center">
+  <img width="650" alt="Demo: typing in a notes window, opening Snipt with the shortcut, searching 'lin' and 'git', and pasting the LinkedIn and GitHub links" src="media/snipt-demo-en.gif"><br>
+  <sub>Shortcut, a few letters, Enter: the snippet lands where you were typing</sub>
+</p>
+
 - **~350 KB** single `.exe`. No installer, no runtime, no web view. Download it and run it.
 - **~2.5 MB** private memory while running, and no CPU at all while it waits in the tray.
 - Pure Rust + Win32 + GDI, with a single dependency (`windows-sys`, plain API bindings). Icons come from the Segoe Fluent Icons font built into Windows.
