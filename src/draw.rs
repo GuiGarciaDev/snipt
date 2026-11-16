@@ -1,4 +1,5 @@
-//! Theme, layout and GDI drawing for the three screens: Browse, Manage, Edit.
+//! Theme, layout and GDI drawing for the screens: Browse, Manage, Edit and
+//! Change shortcut.
 //!
 //! Everything is laid out in 96-DPI units and scaled with `App::r` / `App::s`.
 //! While painting, every clickable area is recorded in `App::regions`, so hit
@@ -8,7 +9,7 @@ use crate::anim::{CONFIRM_MS, SELECT_MS, Tween};
 use crate::snippets::{Kind, Snippet};
 use crate::{Action, App, Mode, PLACEHOLDERS};
 use std::mem::zeroed;
-use std::ptr::{null, null_mut};
+use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{COLORREF, LPARAM, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
@@ -23,10 +24,14 @@ pub const BG: COLORREF = rgb(16, 16, 18); // near-black window
 pub const SURFACE: COLORREF = rgb(27, 27, 31); // search field, inputs, key caps
 pub const HOVER: COLORREF = rgb(36, 36, 41);
 pub const BORDER: COLORREF = rgb(42, 42, 48);
-pub const SELECTED: COLORREF = rgb(31, 26, 44); // purple-tinted dark
-pub const ACCENT: COLORREF = rgb(139, 92, 246);
-pub const ACCENT_HOVER: COLORREF = rgb(154, 114, 250);
-pub const ACCENT_TEXT: COLORREF = rgb(184, 164, 252);
+pub const SELECTED: COLORREF = rgb(17, 36, 40); // cyan-tinted dark
+pub const ACCENT: COLORREF = rgb(52, 216, 234); // #34D8EA
+pub const ACCENT_HOVER: COLORREF = rgb(110, 228, 241);
+pub const ACCENT_TEXT: COLORREF = rgb(134, 232, 243);
+/// Text on accent-filled buttons: the cyan is bright, so dark text reads best.
+pub const ON_ACCENT: COLORREF = rgb(6, 26, 30);
+/// Outline of selected controls (segments, keycaps).
+pub const ACCENT_EDGE: COLORREF = rgb(28, 98, 108);
 pub const TEXT: COLORREF = rgb(232, 232, 237);
 pub const MUTED: COLORREF = rgb(145, 145, 156);
 pub const FAINT: COLORREF = rgb(98, 98, 108);
@@ -61,6 +66,7 @@ const IC_CALENDAR: u32 = 0xE787;
 const IC_EDIT: u32 = 0xE70F;
 const IC_DELETE: u32 = 0xE74D;
 const IC_ADD: u32 = 0xE710;
+const IC_PIN: u32 = 0xE718;
 
 // ---------------------------------------------------------------- layout (96-DPI units)
 
@@ -90,6 +96,13 @@ pub const E_BODY: (i32, i32) = (169, 297);
 const E_HINT: (i32, i32) = (301, 321);
 const E_FOOT: i32 = 329;
 pub const EDIT_H: i32 = 373;
+
+// "Change shortcut" screen.
+const K_INTRO: (i32, i32) = (38, 56);
+const K_BOX: (i32, i32) = (64, 116);
+const K_MSG: (i32, i32) = (122, 142);
+const K_FOOT: i32 = 150;
+pub const SHORTCUT_H: i32 = 194;
 
 // ---------------------------------------------------------------- fonts
 
@@ -260,6 +273,7 @@ pub unsafe fn paint(a: &mut App) {
     match a.mode {
         Mode::Browse | Mode::Manage => paint_list(a, dc),
         Mode::Edit => paint_editor(a, dc),
+        Mode::Shortcut => paint_shortcut(a, dc),
     }
 
     BitBlt(hdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
@@ -393,9 +407,9 @@ unsafe fn paint_list(a: &mut App, dc: HDC) {
     }
     let selected_url = a.hits.get(a.sel).is_some_and(|&i| a.all[i].kind == Kind::Url);
     let items: &[(&str, &str)] = match (manage, selected_url) {
-        (true, _) => &[("Enter", "Edit"), ("Del", "Delete"), ("Esc", "Done")],
+        (true, _) => &[("Enter", "Edit"), ("Del", "Delete"), ("Ctrl+P", "Pin"), ("Esc", "Done")],
         (false, true) => &[("↑↓", "Navigate"), ("Enter", "Paste"), ("Shift+Enter", "Open"), ("Ctrl+E", "Edit")],
-        (false, false) => &[("↑↓", "Navigate"), ("Enter", "Paste"), ("Ctrl+E", "Edit")],
+        (false, false) => &[("↑↓", "Navigate"), ("Enter", "Paste"), ("Ctrl+E", "Edit"), ("Ctrl+P", "Pin")],
     };
     for (key, label) in items {
         match keycap(a, dc, x, limit, fy, key, label) {
@@ -438,30 +452,36 @@ unsafe fn paint_row(a: &mut App, dc: HDC, y0: i32, idx: usize, si: usize, manage
     let bt = a.s(y0 + (ROW_H - 16) / 2);
     let badge = RECT { left: r.right - a.s(10) - bw, top: bt, right: r.right - a.s(10), bottom: bt + a.s(16) };
     let (bg, fg) = match s.kind {
-        Kind::Url => (rgb(62, 40, 120), rgb(214, 200, 255)),
-        Kind::Template => (rgb(42, 32, 70), ACCENT_TEXT),
+        Kind::Url => (rgb(18, 74, 84), rgb(190, 246, 252)),
+        Kind::Template => (rgb(20, 46, 52), ACCENT_TEXT),
         Kind::Text => (rgb(34, 34, 39), MUTED),
     };
     rrect(dc, badge, a.s(4), bg, bg);
     text(dc, label, badge, f.badge, fg, DT_CENTER);
     let mut text_right = badge.left - a.s(10);
 
-    // Manage mode: edit / delete buttons on the selected row.
+    // Manage mode: delete / edit / pin buttons on the selected row.
     if manage && selected {
         let mut x = badge.left - a.s(6);
-        for (icon, act) in [(IC_DELETE, Action::DeleteRow(si)), (IC_EDIT, Action::EditRow(si))] {
+        for (icon, act) in [(IC_DELETE, Action::DeleteRow(si)), (IC_EDIT, Action::EditRow(si)), (IC_PIN, Action::PinRow(si))] {
             let b = RECT { left: x - a.s(24), top: a.s(y0 + 9), right: x, bottom: a.s(y0 + ROW_H - 9) };
             let danger = icon == IC_DELETE;
             if a.hover == Some(act) {
                 let bg = hv(a, act, SELECTED, if danger { DANGER_BG } else { HOVER });
                 rrect(dc, b, a.s(6), bg, bg);
             }
-            let c = hv(a, act, MUTED, if danger { DANGER } else { TEXT });
+            let base = if icon == IC_PIN && s.pinned { ACCENT_TEXT } else { MUTED };
+            let c = hv(a, act, base, if danger { DANGER } else { TEXT });
             glyph(dc, icon, b, f.icon_small, c);
             a.regions.push((b, act));
             x = b.left - a.s(2);
         }
         text_right = x - a.s(8);
+    } else if s.pinned {
+        // Small pin next to the badge.
+        let pin = RECT { left: badge.left - a.s(20), top: badge.top, right: badge.left - a.s(4), bottom: badge.bottom };
+        glyph(dc, IC_PIN, pin, f.icon_small, if selected { ACCENT_TEXT } else { FAINT });
+        text_right = pin.left - a.s(6);
     }
 
     let lx = a.s(PAD + 38);
@@ -525,7 +545,7 @@ unsafe fn paint_editor(a: &mut App, dc: HDC) {
         let on = a.editor.kind == k;
         let act = Action::SetKind(k);
         if on {
-            rrect(dc, seg, a.s(6), SELECTED, rgb(74, 52, 140));
+            rrect(dc, seg, a.s(6), SELECTED, ACCENT_EDGE);
         } else if a.hover == Some(act) {
             let bg = hv(a, act, SURFACE, HOVER);
             rrect(dc, seg, a.s(6), bg, bg);
@@ -542,6 +562,23 @@ unsafe fn paint_editor(a: &mut App, dc: HDC) {
         text(dc, name, RECT { left: sx + a.s(20), right: seg.right, ..seg }, f.small, c, 0);
         a.regions.push((seg, Action::SetKind(k)));
     }
+
+    // Pin toggle, right of the type control.
+    let pin = a.r(x1 - 84, E_TYPE.0, x1, E_TYPE.1);
+    let on = a.editor.pinned;
+    let act = Action::TogglePin;
+    if on {
+        rrect(dc, pin, a.s(8), SELECTED, ACCENT_EDGE);
+    } else {
+        rrect(dc, pin, a.s(8), hv(a, act, SURFACE, HOVER), BORDER);
+    }
+    let c = if on { ACCENT_TEXT } else { hv(a, act, MUTED, TEXT) };
+    let name = if on { "Pinned" } else { "Pin" };
+    let tw = a.s(14) + a.s(6) + text_w(dc, name, f.small);
+    let px = pin.left + (pin.right - pin.left - tw) / 2;
+    glyph(dc, IC_PIN, RECT { left: px, right: px + a.s(14), ..pin }, f.icon_small, c);
+    text(dc, name, RECT { left: px + a.s(20), right: pin.right, ..pin }, f.small, c, 0);
+    a.regions.push((pin, act));
 
     // Hint / error line
     let hint = a.r(x0, E_HINT.0, x1, E_HINT.1);
@@ -573,7 +610,7 @@ unsafe fn paint_editor(a: &mut App, dc: HDC) {
     let cancel = a.r(x1 - 76 - 8 - 76, bt, x1 - 76 - 8, bb);
     let save_bg = hv(a, Action::Save, ACCENT, ACCENT_HOVER);
     rrect(dc, save, a.s(6), save_bg, save_bg);
-    text(dc, "Save", save, f.small, rgb(255, 255, 255), DT_CENTER);
+    text(dc, "Save", save, f.small, ON_ACCENT, DT_CENTER);
     rrect(dc, cancel, a.s(6), hv(a, Action::Cancel, SURFACE, HOVER), BORDER);
     text(dc, "Cancel", cancel, f.small, TEXT, DT_CENTER);
     a.regions.push((save, Action::Save));
@@ -607,6 +644,75 @@ unsafe fn paint_editor(a: &mut App, dc: HDC) {
     }
 }
 
+// ---------------------------------------------------------------- change shortcut
+
+unsafe fn paint_shortcut(a: &mut App, dc: HDC) {
+    let f = &a.fonts;
+    let (x0, x1) = (EX, WIDTH - EX);
+    let ui = &a.shortcut;
+
+    text(dc, "Change shortcut", a.r(x0, E_HEAD.0, x1, E_HEAD.1), f.name, TEXT, 0);
+    text(dc, if ui.saved { "Esc to close" } else { "Esc to cancel" }, a.r(x0, E_HEAD.0, x1, E_HEAD.1), f.tiny, FAINT, DT_RIGHT);
+    text(dc, "Press the keys you want to use to open Snipt.", a.r(x0, K_INTRO.0, x1, K_INTRO.1), f.small, MUTED, 0);
+
+    // The combination as keycaps: what you're pressing, else the current one.
+    let ok = ui.saved && !ui.error;
+    let field = a.r(x0, K_BOX.0, x1, K_BOX.1);
+    rrect(dc, field, a.s(8), SURFACE, if ok { ACCENT } else { BORDER });
+    let parts: Vec<String> = if !ui.preview.is_empty() {
+        ui.preview.clone()
+    } else if let Some(h) = a.hotkey_parts() {
+        h
+    } else {
+        Vec::new()
+    };
+    if parts.is_empty() {
+        text(dc, "No shortcut", field, f.small, FAINT, DT_CENTER);
+    } else {
+        let plus = text_w(dc, "+", f.small);
+        let widths: Vec<i32> = parts.iter().map(|p| text_w(dc, p, f.name) + a.s(22)).collect();
+        let total: i32 = widths.iter().sum::<i32>() + (parts.len() as i32 - 1) * (plus + a.s(16));
+        let mut x = field.left + (field.right - field.left - total) / 2;
+        let ch = a.s(30);
+        let top = field.top + (field.bottom - field.top - ch) / 2;
+        for (i, (p, w)) in parts.iter().zip(&widths).enumerate() {
+            if i > 0 {
+                text(dc, "+", RECT { left: x + a.s(8), right: x + a.s(8) + plus, ..field }, f.small, FAINT, 0);
+                x += plus + a.s(16);
+            }
+            let cap = RECT { left: x, top, right: x + w, bottom: top + ch };
+            if p == "\u{2026}" {
+                text(dc, p, cap, f.name, FAINT, DT_CENTER);
+            } else {
+                rrect(dc, cap, a.s(6), BG, if ok { ACCENT_EDGE } else { BORDER });
+                text(dc, p, cap, f.name, if ok { ACCENT_TEXT } else { TEXT }, DT_CENTER);
+            }
+            x += w;
+        }
+    }
+
+    let (msg, color) = if ui.message.is_empty() {
+        ("Use Ctrl, Alt or Win with a letter, number or F-key.", FAINT)
+    } else {
+        (ui.message.as_str(), if ui.error { DANGER } else { ACCENT_TEXT })
+    };
+    text(dc, msg, a.r(x0, K_MSG.0, x1, K_MSG.1), f.tiny, color, 0);
+
+    // Footer: Reset to default (left), Done (right)
+    fill(dc, a.r(0, K_FOOT, WIDTH, K_FOOT + 1), BORDER);
+    let (bt, bb) = (K_FOOT + 9, K_FOOT + 35);
+    let done = a.r(x1 - 76, bt, x1, bb);
+    let done_bg = hv(a, Action::Done, ACCENT, ACCENT_HOVER);
+    rrect(dc, done, a.s(6), done_bg, done_bg);
+    text(dc, "Done", done, f.small, ON_ACCENT, DT_CENTER);
+    let label = "Reset to default";
+    let reset = RECT { left: a.s(x0), right: a.s(x0) + text_w(dc, label, f.small) + a.s(22), ..done };
+    rrect(dc, reset, a.s(6), hv(a, Action::ResetShortcut, SURFACE, HOVER), BORDER);
+    text(dc, label, reset, f.small, TEXT, DT_CENTER);
+    a.regions.push((done, Action::Done));
+    a.regions.push((reset, Action::ResetShortcut));
+}
+
 unsafe fn editor_keycap(a: &App, dc: HDC, right: i32, kw: i32, row: RECT, key: &str) {
     let f = &a.fonts;
     let lw = text_w(dc, "Save", f.tiny);
@@ -616,35 +722,4 @@ unsafe fn editor_keycap(a: &App, dc: HDC, right: i32, kw: i32, row: RECT, key: &
     let cap = RECT { left: label.left - a.s(5) - kw, top, right: label.left - a.s(5), bottom: top + a.s(18) };
     rrect(dc, cap, a.s(4), SURFACE, BORDER);
     text(dc, key, cap, f.tiny, TEXT, DT_CENTER);
-}
-
-/// Draws the tray icon at runtime (no .ico file needed): a purple tile with "S".
-pub unsafe fn make_icon(face: &str) -> HICON {
-    const N: i32 = 32;
-    let screen = GetDC(null_mut());
-    let dc = CreateCompatibleDC(screen);
-    let color = CreateCompatibleBitmap(screen, N, N);
-    let mask = CreateBitmap(N, N, 1, 1, null());
-    let full = RECT { left: 0, top: 0, right: N, bottom: N };
-
-    let old = SelectObject(dc, color as HGDIOBJ);
-    fill(dc, full, 0);
-    rrect(dc, full, 12, ACCENT, ACCENT);
-    SetBkMode(dc, TRANSPARENT as i32);
-    let f = font(24, 700, face);
-    text(dc, "S", RECT { top: -1, ..full }, f, rgb(255, 255, 255), DT_CENTER);
-    DeleteObject(f as HGDIOBJ);
-
-    SelectObject(dc, mask as HGDIOBJ);
-    fill(dc, full, rgb(255, 255, 255)); // 1 = transparent
-    rrect(dc, full, 12, 0, 0); // 0 = opaque
-    SelectObject(dc, old);
-
-    let info = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
-    let icon = CreateIconIndirect(&info);
-    DeleteObject(color as HGDIOBJ);
-    DeleteObject(mask as HGDIOBJ);
-    DeleteDC(dc);
-    ReleaseDC(null_mut(), screen);
-    icon
 }

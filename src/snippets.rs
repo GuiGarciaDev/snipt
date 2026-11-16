@@ -14,7 +14,8 @@
 //!
 //! Every line starting with `@ ` begins a new snippet. An optional `[url]`,
 //! `[text]` or `[template]` tag at the end of the name sets the type; without
-//! it the type is detected from the content. Start a body line with `\@` to
+//! it the type is detected from the content. Adding `pin` (`[pin]`,
+//! `[url, pin]`) keeps the snippet at the top of the list. Start a body line with `\@` to
 //! write a literal `@` at the beginning of a line.
 
 use std::path::PathBuf;
@@ -59,6 +60,7 @@ impl Snippet {
             name: name.to_string(),
             body: body.to_string(),
             kind,
+            pinned: false,
             preview,
             name_lower: name.to_lowercase(),
             body_lower: body.to_lowercase(),
@@ -107,8 +109,15 @@ fn serialize(header: &str, all: &[Snippet]) -> String {
     for s in all {
         out.push_str("\n@ ");
         out.push_str(&s.name);
+        let mut tags = Vec::new();
         if detect(&s.body) != s.kind {
-            out.push_str(&format!(" [{}]", s.kind.tag()));
+            tags.push(s.kind.tag());
+        }
+        if s.pinned {
+            tags.push("pin");
+        }
+        if !tags.is_empty() {
+            out.push_str(&format!(" [{}]", tags.join(", ")));
         }
         out.push('\n');
         for line in s.body.lines() {
@@ -127,6 +136,8 @@ pub struct Snippet {
     pub name: String,
     pub body: String,
     pub kind: Kind,
+    /// Always listed first.
+    pub pinned: bool,
     /// Single-line preview shown under the name.
     pub preview: String,
     name_lower: String,
@@ -136,6 +147,7 @@ pub struct Snippet {
 const SAMPLE_HEADER: &str = "\
 # Snipt snippets file. Edit it here or from Snipt (gear icon / Ctrl+E).
 # Each entry starts with a line '@ Name' and an optional [url] / [text] / [template] tag.
+# Add 'pin' to keep a snippet at the top, e.g. [pin] or [url, pin].
 # Template variables: {date} {time} {datetime} {clipboard} {cursor}
 ";
 
@@ -143,13 +155,14 @@ const SAMPLE: &str = concat!(
     "\
 # Snipt snippets file. Edit it here or from Snipt (gear icon / Ctrl+E).
 # Each entry starts with a line '@ Name' and an optional [url] / [text] / [template] tag.
+# Add 'pin' to keep a snippet at the top, e.g. [pin] or [url, pin].
 # Template variables: {date} {time} {datetime} {clipboard} {cursor}
 ",
     "
 @ Snipt on GitHub [url]
 https://github.com/
 
-@ Email sign-off
+@ Email sign-off [pin]
 Best regards,
 {cursor}
 
@@ -221,7 +234,7 @@ pub fn parse(text: &str) -> Vec<Snippet> {
 }
 
 fn push(out: &mut Vec<Snippet>, header: String, lines: &[&str]) {
-    let (name, tag) = split_tag(&header);
+    let (name, tag, pinned) = split_tag(&header);
     if name.is_empty() {
         return;
     }
@@ -230,24 +243,32 @@ fn push(out: &mut Vec<Snippet>, header: String, lines: &[&str]) {
     let body = lines[start..end.max(start)].join("\n");
 
     let kind = tag.unwrap_or_else(|| detect(&body));
-    out.push(Snippet::new(&name, &body, kind));
+    let mut snippet = Snippet::new(&name, &body, kind);
+    snippet.pinned = pinned;
+    out.push(snippet);
 }
 
-fn split_tag(header: &str) -> (String, Option<Kind>) {
+/// Splits `Name [url, pin]` into the name, an optional type and the pin flag.
+/// A bracket with anything unknown inside is treated as part of the name.
+fn split_tag(header: &str) -> (String, Option<Kind>, bool) {
     if header.ends_with(']') {
         if let Some(open) = header.rfind('[') {
-            let tag = match header[open + 1..header.len() - 1].trim().to_lowercase().as_str() {
-                "url" | "link" => Some(Kind::Url),
-                "text" | "txt" => Some(Kind::Text),
-                "template" | "tpl" => Some(Kind::Template),
-                _ => None,
-            };
-            if tag.is_some() {
-                return (header[..open].trim().to_string(), tag);
+            let (mut kind, mut pin, mut known) = (None, false, true);
+            for t in header[open + 1..header.len() - 1].split(',') {
+                match t.trim().to_lowercase().as_str() {
+                    "url" | "link" => kind = Some(Kind::Url),
+                    "text" | "txt" => kind = Some(Kind::Text),
+                    "template" | "tpl" => kind = Some(Kind::Template),
+                    "pin" | "pinned" => pin = true,
+                    _ => known = false,
+                }
+            }
+            if known {
+                return (header[..open].trim().to_string(), kind, pin);
             }
         }
     }
-    (header.trim().to_string(), None)
+    (header.trim().to_string(), None, false)
 }
 
 pub fn detect(body: &str) -> Kind {
@@ -265,14 +286,15 @@ pub fn detect(body: &str) -> Kind {
     }
 }
 
-/// Returns indices into `all`, best match first. Every space-separated word of
+/// Returns indices into `all` in display order. Every space-separated word of
 /// the query must match the name (fuzzy) or appear in the body (substring).
-pub fn search(all: &[Snippet], query: &str) -> Vec<usize> {
+///
+/// Order: pinned snippets first, then the best match, then `usage` (how much
+/// you have used a snippet lately). With an empty query that means pinned,
+/// then most used, then the rest in file order.
+pub fn search(all: &[Snippet], query: &str, usage: impl Fn(&Snippet) -> f64) -> Vec<usize> {
     let words: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
-    if words.is_empty() {
-        return (0..all.len()).collect();
-    }
-    let mut scored: Vec<(i32, usize)> = all
+    let mut scored: Vec<(bool, i32, f64, usize)> = all
         .iter()
         .enumerate()
         .filter_map(|(i, s)| {
@@ -282,12 +304,16 @@ pub fn search(all: &[Snippet], query: &str) -> Vec<usize> {
                 let body_score = s.body_lower.contains(w.as_str()).then_some(w.chars().count() as i32 * 3);
                 total += name_score.max(body_score)?;
             }
-            Some((total, i))
+            Some((s.pinned, total, usage(s), i))
         })
         .collect();
     // Stable sort keeps file order for ties.
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-    scored.into_iter().map(|(_, i)| i).collect()
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(b.1.cmp(&a.1))
+            .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    scored.into_iter().map(|(.., i)| i).collect()
 }
 
 /// Subsequence match with bonuses for consecutive chars, word starts and prefix.
@@ -364,10 +390,43 @@ mod tests {
     #[test]
     fn search_ranks_name_prefix_first() {
         let s = parse("@ Address home\n1 Main St\n@ Email address\nme@x.com\n@ Other\nnothing\n");
-        let r = search(&s, "addr");
+        let none = |_: &Snippet| 0.0;
+        let r = search(&s, "addr", none);
         assert_eq!(r, vec![0, 1]);
-        assert_eq!(search(&s, "main"), vec![0]);
-        assert_eq!(search(&s, "").len(), 3);
-        assert!(search(&s, "zzz").is_empty());
+        assert_eq!(search(&s, "main", none), vec![0]);
+        assert_eq!(search(&s, "", none).len(), 3);
+        assert!(search(&s, "zzz", none).is_empty());
+    }
+
+    #[test]
+    fn pin_tags_parse_and_round_trip() {
+        let s = parse("@ A [url, pin]\nhttps://a.b\n@ B [pin]\nhi\n@ C [Pinned, TEXT]\nhttps://c.d\n@ D [draft]\nx\n");
+        assert_eq!((s[0].kind, s[0].pinned), (Kind::Url, true));
+        assert_eq!((s[1].name.as_str(), s[1].kind, s[1].pinned), ("B", Kind::Text, true));
+        assert_eq!((s[2].kind, s[2].pinned), (Kind::Text, true));
+        assert_eq!((s[3].name.as_str(), s[3].pinned), ("D [draft]", false)); // unknown tag stays in the name
+        let text = serialize("#", &s);
+        assert!(text.contains("@ A [pin]\n")); // url is detected anyway
+        assert!(text.contains("@ C [text, pin]\n"));
+        let back = parse(&text);
+        for (a, b) in s.iter().zip(&back) {
+            assert_eq!((&a.name, a.kind, a.pinned), (&b.name, b.kind, b.pinned));
+        }
+    }
+
+    #[test]
+    fn order_is_pinned_then_match_then_usage() {
+        let s = parse("@ Alpha\na\n@ Beta\nb\n@ Gamma [pin]\ng\n@ Delta\nd\n");
+        let usage = |x: &Snippet| match x.name.as_str() {
+            "Delta" => 5.0,
+            "Beta" => 2.0,
+            _ => 0.0,
+        };
+        // Empty search: pinned, then most used, then file order.
+        assert_eq!(search(&s, "", usage), vec![2, 3, 1, 0]);
+        // While searching, the match decides and usage only breaks ties.
+        let s = parse("@ Note one\nx\n@ Note two\ny\n");
+        let usage = |x: &Snippet| if x.name == "Note two" { 1.0 } else { 0.0 };
+        assert_eq!(search(&s, "note", usage), vec![1, 0]);
     }
 }

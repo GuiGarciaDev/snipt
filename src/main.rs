@@ -6,10 +6,13 @@
 
 mod anim;
 mod draw;
+mod hotkey;
 mod paste;
 mod snippets;
+mod usage;
 
-use draw::{EDIT_H, EX, E_BODY, E_TITLE, Fonts, MAX_ROWS, MIN_ROWS, WIDTH};
+use draw::{EDIT_H, EX, E_BODY, E_TITLE, Fonts, MAX_ROWS, MIN_ROWS, SHORTCUT_H, WIDTH};
+use hotkey::Hotkey;
 use snippets::{Kind, Snippet};
 use std::mem::zeroed;
 use std::ptr::{null, null_mut};
@@ -37,6 +40,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_SHOW: u32 = WM_APP + 2;
+/// From the keyboard hook of the shortcut screen: wParam = key, lParam = modifiers.
+const WM_SHORTCUT_KEY: u32 = WM_APP + 3;
+const WM_SHORTCUT_KEYUP: u32 = WM_APP + 4;
 const HOTKEY_ID: i32 = 1;
 const TIMER_RESTORE: usize = 1;
 const TIMER_ANIM: usize = 2;
@@ -47,6 +53,7 @@ const ID_MANAGE: usize = 101;
 const ID_FILE: usize = 102;
 const ID_AUTOSTART: usize = 103;
 const ID_EXIT: usize = 104;
+const ID_SHORTCUT: usize = 105;
 const ID_TITLE: usize = 200;
 const ID_BODY: usize = 201;
 
@@ -66,6 +73,15 @@ pub enum Mode {
     Manage,
     /// Create or edit one snippet.
     Edit,
+    /// "Change shortcut": waits for the new key combination.
+    Shortcut,
+}
+
+impl Mode {
+    /// Browse or Manage: the search field and the list are on screen.
+    pub fn is_list(self) -> bool {
+        matches!(self, Mode::Browse | Mode::Manage)
+    }
 }
 
 /// Something clickable, recorded while painting.
@@ -77,6 +93,7 @@ pub enum Action {
     New,
     EditRow(usize),
     DeleteRow(usize),
+    PinRow(usize),
     ConfirmDelete,
     CancelDelete,
     SetKind(Kind),
@@ -84,6 +101,9 @@ pub enum Action {
     Save,
     Cancel,
     EditorDelete,
+    TogglePin,
+    ResetShortcut,
+    Done,
 }
 
 pub struct Editor {
@@ -92,7 +112,23 @@ pub struct Editor {
     pub kind: Kind,
     pub error: String,
     pub confirm_delete: bool,
+    pub pinned: bool,
     back: Mode,
+}
+
+/// State of the "Change shortcut" screen.
+#[derive(Default)]
+pub struct ShortcutUi {
+    /// On screen and the old shortcut is temporarily released.
+    active: bool,
+    /// Keys held right now (or the last combination tried), as keycaps.
+    pub preview: Vec<String>,
+    pub message: String,
+    pub error: bool,
+    /// A new shortcut was registered and saved.
+    pub saved: bool,
+    /// Modifiers held, as seen by the keyboard hook.
+    held: HOT_KEY_MODIFIERS,
 }
 
 pub struct App {
@@ -121,7 +157,13 @@ pub struct App {
     pub text_face: &'static str,
     pub icon_face: &'static str,
     restore: Option<String>,
-    hotkey: &'static str,
+    /// The shortcut in use (or chosen), and its label for menus and the UI.
+    hotkey_now: Option<Hotkey>,
+    pub hotkey: String,
+    pub shortcut: ShortcutUi,
+    usage: usage::Usage,
+    /// Keyboard hook, only while the shortcut screen is open.
+    key_hook: HHOOK,
     taskbar_created: u32,
     icon: HICON,
     pub anim: anim::Anim,
@@ -136,6 +178,10 @@ impl App {
     }
     pub fn r(&self, l: i32, t: i32, r: i32, b: i32) -> RECT {
         RECT { left: self.s(l), top: self.s(t), right: self.s(r), bottom: self.s(b) }
+    }
+    /// The current shortcut as keycap labels, e.g. ["Ctrl", "Shift", "Space"].
+    pub fn hotkey_parts(&self) -> Option<Vec<String>> {
+        self.hotkey_now.map(|h| h.parts())
     }
 }
 
@@ -176,12 +222,12 @@ fn main() {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: inst,
-            hIcon: null_mut(),
+            hIcon: app_icon(GetSystemMetrics(SM_CXICON)),
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
             hbrBackground: null_mut(),
             lpszMenuName: null(),
             lpszClassName: class.as_ptr(),
-            hIconSm: null_mut(),
+            hIconSm: app_icon(GetSystemMetrics(SM_CXSMICON)),
         };
         RegisterClassExW(&wc);
 
@@ -197,7 +243,7 @@ fn main() {
             top: 0,
             rows: MIN_ROWS,
             mode: Mode::Browse,
-            editor: Editor { index: None, kind: Kind::Template, error: String::new(), confirm_delete: false, back: Mode::Browse },
+            editor: Editor { index: None, kind: Kind::Template, error: String::new(), confirm_delete: false, pinned: false, back: Mode::Browse },
             confirm: None,
             hover: None,
             regions: Vec::new(),
@@ -210,9 +256,13 @@ fn main() {
             text_face,
             icon_face,
             restore: None,
-            hotkey: "no hotkey (use the tray icon)",
+            hotkey_now: None,
+            hotkey: "no hotkey (use the tray icon)".to_string(),
+            shortcut: ShortcutUi::default(),
+            usage: usage::Usage::load(),
+            key_hook: null_mut(),
             taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
-            icon: draw::make_icon(text_face),
+            icon: app_icon(GetSystemMetrics(SM_CXSMICON)),
             anim: anim::Anim::new(),
             caret_on: true,
             caret_rect: RECT { left: 0, top: 0, right: 0, bottom: 0 },
@@ -253,17 +303,11 @@ fn main() {
         DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE as u32, &corners as *const _ as _, 4);
         DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR as u32, &border as *const _ as _, 4);
 
-        // First free shortcut wins.
-        let choices: [(HOT_KEY_MODIFIERS, u32, &'static str); 3] = [
-            (MOD_WIN | MOD_SHIFT, 'V' as u32, "Win+Shift+V"),
-            (MOD_CONTROL | MOD_SHIFT, VK_SPACE as u32, "Ctrl+Shift+Space"),
-            (MOD_CONTROL | MOD_ALT, 'V' as u32, "Ctrl+Alt+V"),
-        ];
-        for (mods, vk, label) in choices {
-            if RegisterHotKey(hwnd, HOTKEY_ID, mods | MOD_NOREPEAT, vk) != 0 {
-                a.hotkey = label;
-                break;
-            }
+        // The shortcut you chose, else the first free default.
+        let saved = hotkey::load_saved();
+        let saved_ok = saved.is_some_and(|h| register(h));
+        if !saved_ok {
+            register_default();
         }
 
         // If "Start with Windows" is on, point it at this copy of the exe, so
@@ -273,7 +317,10 @@ fn main() {
         }
 
         tray(NIM_ADD, None);
-        if first_run {
+        if let (Some(h), false) = (saved, saved_ok) {
+            let msg = format!("{} is in use by another app, so Snipt uses {} for now. Change it from the tray menu.", h.label(), a.hotkey);
+            tray(NIM_MODIFY, Some(&msg));
+        } else if first_run {
             let msg = format!("Snipt is running. Press {} to open it.", a.hotkey);
             tray(NIM_MODIFY, Some(&msg));
         }
@@ -298,6 +345,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
     let a = app();
     match msg {
+        WM_HOTKEY if a.mode == Mode::Shortcut && shown() => {} // just picked it
         WM_HOTKEY => {
             if !shown() {
                 show(Mode::Browse);
@@ -336,6 +384,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             ID_MANAGE => show(Mode::Manage),
             ID_FILE => open_file(),
             ID_AUTOSTART => set_autostart(!autostart_enabled()),
+            ID_SHORTCUT => show(Mode::Shortcut),
             ID_EXIT => {
                 DestroyWindow(hwnd);
             }
@@ -362,7 +411,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             restart_blink();
             on_key(wp as u16)
         }
-        WM_CHAR if a.mode != Mode::Edit => {
+        // Alt combinations arrive as "system" keys.
+        WM_SHORTCUT_KEY => shortcut_key(wp as u16, lp as HOT_KEY_MODIFIERS),
+        WM_SHORTCUT_KEYUP => shortcut_keyup(lp as HOT_KEY_MODIFIERS),
+        WM_SYSKEYDOWN if a.mode == Mode::Shortcut => shortcut_key(wp as u16, held_mods()),
+        WM_SYSCHAR if a.mode == Mode::Shortcut => {}
+        WM_KEYUP | WM_SYSKEYUP if a.mode == Mode::Shortcut => shortcut_keyup(held_mods()),
+        WM_CHAR if a.mode.is_list() => {
             let c = wp as u32;
             if c >= 0x20 && c != 0x7f && GetKeyState(VK_CONTROL as i32) >= 0 {
                 if let Some(ch) = char::from_u32(c) {
@@ -402,7 +457,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 click(act);
             }
         }
-        WM_MOUSEWHEEL if a.mode != Mode::Edit => {
+        WM_MOUSEWHEEL if a.mode.is_list() => {
             let delta = ((wp >> 16) & 0xffff) as i16;
             let max_top = a.hits.len().saturating_sub(a.rows);
             a.top = if delta > 0 { a.top.saturating_sub(1) } else { (a.top + 1).min(max_top) };
@@ -411,7 +466,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TIMER if wp == TIMER_ANIM => tick(),
         WM_TIMER if wp == TIMER_BLINK => {
-            if !shown() || a.mode == Mode::Edit {
+            if !shown() || !a.mode.is_list() {
                 stop_blink();
             } else {
                 a.caret_on = !a.caret_on;
@@ -470,6 +525,13 @@ unsafe fn click(act: Action) {
             a.confirm = Some(si);
             redraw();
         }
+        Action::PinRow(si) => toggle_pin(si),
+        Action::TogglePin => {
+            a.editor.pinned = !a.editor.pinned;
+            redraw();
+        }
+        Action::ResetShortcut => reset_shortcut(),
+        Action::Done => hide(true),
         Action::ConfirmDelete => {
             if let Some(si) = a.confirm.take() {
                 delete(si);
@@ -512,6 +574,9 @@ unsafe fn show(mode: Mode) {
         return force_foreground(a.hwnd);
     }
     finish_close(); // reopened mid fade-out: start fresh
+    if shown() && a.mode == Mode::Shortcut && mode != Mode::Shortcut {
+        leave_shortcut();
+    }
     let fg = GetForegroundWindow();
     a.prev = if fg == a.hwnd { null_mut() } else { fg };
     a.all = snippets::load(); // tiny file; reloading picks up outside edits
@@ -520,6 +585,9 @@ unsafe fn show(mode: Mode) {
     a.hover = None;
     a.mode = mode;
     refilter();
+    if mode == Mode::Shortcut {
+        begin_shortcut();
+    }
 
     let anchor = anchor_point(a.prev);
     let mon = MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST);
@@ -570,7 +638,7 @@ unsafe fn restart_blink() {
         InvalidateRect(a.hwnd, &a.caret_rect, 0);
     }
     let ms = GetCaretBlinkTime();
-    if a.mode != Mode::Edit && ms != 0 && ms != u32::MAX && shown() {
+    if a.mode.is_list() && ms != 0 && ms != u32::MAX && shown() {
         SetTimer(a.hwnd, TIMER_BLINK, ms, None);
     } else {
         KillTimer(a.hwnd, TIMER_BLINK);
@@ -679,13 +747,17 @@ unsafe fn work_area(p: POINT) -> RECT {
 
 fn height() -> i32 {
     let a = app();
-    if a.mode == Mode::Edit { EDIT_H } else { draw::list_height(a.rows) }
+    match a.mode {
+        Mode::Edit => EDIT_H,
+        Mode::Shortcut => SHORTCUT_H,
+        _ => draw::list_height(a.rows),
+    }
 }
 
 /// Re-fits the window to the current mode, keeping it on screen.
 unsafe fn resize() {
     let a = app();
-    if a.mode != Mode::Edit {
+    if a.mode.is_list() {
         a.rows = a.all.len().clamp(MIN_ROWS, MAX_ROWS);
     }
     let mut r: RECT = zeroed();
@@ -752,6 +824,7 @@ unsafe fn hide(give_back_focus: bool) {
         return;
     }
     stop_blink();
+    leave_shortcut();
     if a.anim.enabled {
         // Continue from the current opacity if it was still fading in.
         let from = if a.anim.layered { a.anim.open.value() } else { 1.0 };
@@ -800,7 +873,7 @@ unsafe fn choose(open_url: bool) {
         let url = snip.body.trim();
         let url = if url.starts_with("www.") { format!("https://{url}") } else { url.to_string() };
         ShellExecuteW(null_mut(), wide("open").as_ptr(), wide(&url).as_ptr(), null(), null(), SW_SHOWNORMAL);
-        return;
+        return count_use(&snip.name);
     }
 
     let old = paste::get_text(a.hwnd);
@@ -817,6 +890,7 @@ unsafe fn choose(open_url: bool) {
         Sleep(10);
     }
     paste::send_paste(expanded.caret_back);
+    count_use(&snip.name); // after pasting, so it never delays the paste
 
     // Put the user's own clipboard back once the target has read ours.
     if old.is_some() {
@@ -825,13 +899,24 @@ unsafe fn choose(open_url: bool) {
     }
 }
 
+/// Remembers that a snippet was used, for the most-used ordering.
+fn count_use(name: &str) {
+    let a = app();
+    a.usage.record(name, usage::now());
+    let _ = a.usage.save();
+}
+
 // ---------------------------------------------------------------- list input
 
 unsafe fn on_key(vk: u16) {
     let a = app();
-    if a.mode == Mode::Edit {
-        editor_key(vk);
-        return;
+    match a.mode {
+        Mode::Edit => {
+            editor_key(vk);
+            return;
+        }
+        Mode::Shortcut => return shortcut_key(vk, held_mods()),
+        _ => {}
     }
     let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
 
@@ -881,6 +966,12 @@ unsafe fn on_key(vk: u16) {
         }
         VK_E if ctrl => return open_editor(selected),
         VK_N if ctrl => return open_editor(None),
+        VK_P if ctrl => {
+            if let Some(si) = selected {
+                toggle_pin(si);
+            }
+            return;
+        }
         _ if n == 0 => return,
         VK_DOWN | VK_TAB => a.sel = (a.sel + 1) % n,
         VK_UP => a.sel = (a.sel + n - 1) % n,
@@ -901,12 +992,37 @@ fn scroll_into_view() {
     }
 }
 
+/// Snippets matching the search, in display order (pinned, best match, most used).
+fn find() -> Vec<usize> {
+    let a = app();
+    let now = usage::now();
+    snippets::search(&a.all, &a.query, |s| a.usage.score(&s.name, now))
+}
+
 fn refilter() {
     let a = app();
-    a.hits = snippets::search(&a.all, &a.query);
+    a.hits = find();
     a.sel = 0;
     a.top = 0;
     a.anim.snap_select = true; // new results: jump, don't glide
+    redraw();
+}
+
+/// Pins or unpins a snippet; the selection follows it to its new place.
+unsafe fn toggle_pin(si: usize) {
+    let a = app();
+    if si >= a.all.len() {
+        return;
+    }
+    a.all[si].pinned = !a.all[si].pinned;
+    let _ = snippets::save(&a.all);
+    a.all = snippets::load(); // same order, so `si` still points at it
+    a.hits = find();
+    a.confirm = None;
+    if let Some(pos) = a.hits.iter().position(|&i| i == si) {
+        a.sel = pos;
+    }
+    scroll_into_view();
     redraw();
 }
 
@@ -922,12 +1038,12 @@ unsafe fn set_mode(m: Mode) {
 unsafe fn open_editor(index: Option<usize>) {
     let a = app();
     let back = if a.mode == Mode::Edit { a.editor.back } else { a.mode };
-    let (title, body, kind) = match index.and_then(|i| a.all.get(i)) {
-        Some(s) => (s.name.clone(), s.body.clone(), s.kind),
+    let (title, body, kind, pinned) = match index.and_then(|i| a.all.get(i)) {
+        Some(s) => (s.name.clone(), s.body.clone(), s.kind, s.pinned),
         // New snippet: what you searched for becomes the title.
-        None => (a.query.trim().to_string(), String::new(), Kind::Template),
+        None => (a.query.trim().to_string(), String::new(), Kind::Template, false),
     };
-    a.editor = Editor { index, kind, error: String::new(), confirm_delete: false, back };
+    a.editor = Editor { index, kind, error: String::new(), confirm_delete: false, pinned, back };
     a.confirm = None;
     a.hover = None;
     a.mode = Mode::Edit;
@@ -1003,6 +1119,10 @@ unsafe fn editor_key(vk: u16) -> bool {
         VK_A if ctrl => {
             SendMessageW(focus, EM_SETSEL, 0, -1);
         }
+        VK_P if ctrl => {
+            a.editor.pinned = !a.editor.pinned;
+            redraw();
+        }
         VK_T if ctrl => {
             let i = Kind::ALL.iter().position(|&k| k == a.editor.kind).unwrap_or(0);
             a.editor.kind = Kind::ALL[(i + 1) % Kind::ALL.len()];
@@ -1042,9 +1162,15 @@ unsafe fn save_editor() {
         return redraw();
     }
 
-    let snippet = Snippet::new(&title, &body, a.editor.kind);
+    let mut snippet = Snippet::new(&title, &body, a.editor.kind);
+    snippet.pinned = a.editor.pinned;
     let index = match a.editor.index {
         Some(i) if i < a.all.len() => {
+            // Renamed: its usage count moves with it.
+            if a.all[i].name != title {
+                a.usage.rename(&a.all[i].name, &title);
+                let _ = a.usage.save();
+            }
             a.all[i] = snippet;
             i
         }
@@ -1073,15 +1199,180 @@ unsafe fn delete(si: usize) {
         return;
     }
     let keep = a.sel;
-    a.all.remove(si);
+    let gone = a.all.remove(si);
+    if !a.all.iter().any(|s| s.name == gone.name) {
+        a.usage.remove(&gone.name);
+        let _ = a.usage.save();
+    }
     let _ = snippets::save(&a.all);
     a.all = snippets::load();
-    a.hits = snippets::search(&a.all, &a.query);
+    a.hits = find();
     a.sel = keep.min(a.hits.len().saturating_sub(1));
     a.top = a.top.min(a.hits.len().saturating_sub(1));
     a.anim.snap_select = true;
     resize();
     scroll_into_view();
+}
+
+// ---------------------------------------------------------------- shortcut
+
+/// Registers `h` as the global shortcut. On success it becomes the current one.
+unsafe fn register(h: Hotkey) -> bool {
+    let a = app();
+    if RegisterHotKey(a.hwnd, HOTKEY_ID, h.mods | MOD_NOREPEAT, h.vk) == 0 {
+        return false;
+    }
+    a.hotkey_now = Some(h);
+    a.hotkey = h.label();
+    true
+}
+
+/// First free default shortcut.
+unsafe fn register_default() -> bool {
+    hotkey::DEFAULTS.into_iter().any(|h| register(h))
+}
+
+/// Opens the screen. The current shortcut is released so it can be picked
+/// again, and a keyboard hook sees keys before any app's shortcut does, so a
+/// combination that's taken can be reported instead of silently vanishing
+/// (and tapping Win doesn't open Start). The hook exists only on this screen.
+unsafe fn begin_shortcut() {
+    let a = app();
+    UnregisterHotKey(a.hwnd, HOTKEY_ID);
+    a.shortcut = ShortcutUi { active: true, ..Default::default() };
+    if a.key_hook.is_null() {
+        a.key_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(key_hook), GetModuleHandleW(null()), 0);
+    }
+}
+
+unsafe extern "system" fn key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let a = app();
+    if code == HC_ACTION as i32 && a.shortcut.active && GetForegroundWindow() == a.hwnd {
+        let vk = (*(lp as *const KBDLLHOOKSTRUCT)).vkCode as u16;
+        let down = matches!(wp as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+        let m = match vk {
+            VK_LWIN | VK_RWIN => MOD_WIN,
+            VK_CONTROL | VK_LCONTROL | VK_RCONTROL => MOD_CONTROL,
+            VK_MENU | VK_LMENU | VK_RMENU => MOD_ALT,
+            VK_SHIFT | VK_LSHIFT | VK_RSHIFT => MOD_SHIFT,
+            _ => 0,
+        };
+        if down {
+            a.shortcut.held |= m;
+        } else {
+            a.shortcut.held &= !m;
+        }
+        let msg = if down { WM_SHORTCUT_KEY } else { WM_SHORTCUT_KEYUP };
+        PostMessageW(a.hwnd, msg, vk as WPARAM, a.shortcut.held as LPARAM);
+        return 1; // swallowed: no other app or shortcut sees it
+    }
+    CallNextHookEx(null_mut(), code, wp, lp)
+}
+
+/// Closes the screen. Without a new shortcut, the previous one comes back.
+unsafe fn leave_shortcut() {
+    let a = app();
+    if !a.shortcut.active {
+        return;
+    }
+    a.shortcut.active = false;
+    if !a.key_hook.is_null() {
+        UnhookWindowsHookEx(a.key_hook);
+        a.key_hook = null_mut();
+    }
+    if !a.shortcut.saved {
+        if let Some(h) = a.hotkey_now {
+            register(h);
+        }
+    }
+}
+
+unsafe fn held_mods() -> HOT_KEY_MODIFIERS {
+    let down = |vk: u16| GetKeyState(vk as i32) < 0;
+    let mut m = 0;
+    if down(VK_LWIN) || down(VK_RWIN) {
+        m |= MOD_WIN;
+    }
+    if down(VK_CONTROL) {
+        m |= MOD_CONTROL;
+    }
+    if down(VK_MENU) {
+        m |= MOD_ALT;
+    }
+    if down(VK_SHIFT) {
+        m |= MOD_SHIFT;
+    }
+    m
+}
+
+/// A key pressed on the "Change shortcut" screen.
+unsafe fn shortcut_key(vk: u16, mods: HOT_KEY_MODIFIERS) {
+    let a = app();
+    if mods == 0 && (vk == VK_ESCAPE || vk == VK_RETURN) {
+        return hide(true);
+    }
+    if hotkey::is_modifier(vk) {
+        // Only modifiers so far: show them while waiting for the key.
+        a.shortcut.preview = hotkey::mod_names(mods);
+        a.shortcut.preview.push("\u{2026}".to_string());
+        return redraw();
+    }
+    let h = Hotkey { mods, vk: vk as u32 };
+    a.shortcut.preview = h.parts();
+    a.shortcut.error = true;
+    if !h.allowed() {
+        a.shortcut.message = "Add Ctrl, Alt or Win. Only F-keys work on their own.".to_string();
+        return redraw();
+    }
+    // Swap: release the one picked a moment ago (if any), try the new one.
+    UnregisterHotKey(a.hwnd, HOTKEY_ID);
+    if register(h) {
+        let _ = hotkey::save(Some(h));
+        a.shortcut.saved = true;
+        a.shortcut.error = false;
+        a.shortcut.message = format!("Saved. Press {} anywhere to open Snipt.", a.hotkey);
+        tray(NIM_MODIFY, None);
+    } else {
+        a.shortcut.message = format!("{} is already used by another app or by Windows. Try another.", h.label());
+        if a.shortcut.saved {
+            if let Some(prev) = a.hotkey_now {
+                register(prev);
+            }
+        }
+    }
+    redraw();
+}
+
+/// Modifier released before a key was pressed: update the preview.
+unsafe fn shortcut_keyup(mods: HOT_KEY_MODIFIERS) {
+    let a = app();
+    if a.shortcut.preview.last().is_some_and(|p| p == "\u{2026}") {
+        a.shortcut.preview = hotkey::mod_names(mods);
+        if mods != 0 {
+            a.shortcut.preview.push("\u{2026}".to_string());
+        }
+        redraw();
+    }
+}
+
+/// Forgets the chosen shortcut and goes back to the first free default.
+unsafe fn reset_shortcut() {
+    let a = app();
+    UnregisterHotKey(a.hwnd, HOTKEY_ID);
+    let _ = hotkey::save(None);
+    a.shortcut.saved = true;
+    a.shortcut.preview.clear();
+    if register_default() {
+        a.shortcut.error = false;
+        a.shortcut.message = format!("Back to the default: {}.", a.hotkey);
+    } else {
+        a.hotkey_now = None;
+        a.hotkey = "no hotkey (use the tray icon)".to_string();
+        a.shortcut.error = true;
+        a.shortcut.message = "All default shortcuts are in use. Pick another one.".to_string();
+    }
+    tray(NIM_MODIFY, None);
+    redraw();
 }
 
 // ---------------------------------------------------------------- dpi
@@ -1102,6 +1393,12 @@ unsafe fn set_dpi(dpi: u32) {
 }
 
 // ---------------------------------------------------------------- tray, file, autostart
+
+/// The icon embedded in the exe by build.rs (resource 1), at the given size.
+unsafe fn app_icon(size: i32) -> HICON {
+    let icon = LoadImageW(GetModuleHandleW(null()), 1 as _, IMAGE_ICON, size, size, LR_DEFAULTCOLOR);
+    if icon.is_null() { LoadIconW(null_mut(), IDI_APPLICATION) } else { icon as HICON }
+}
 
 unsafe fn tray(action: NOTIFY_ICON_MESSAGE, balloon: Option<&str>) {
     let a = app();
@@ -1135,6 +1432,7 @@ unsafe fn tray_menu() {
     AppendMenuW(m, MF_STRING, ID_OPEN, wide(&format!("Open Snipt\t{}", a.hotkey)).as_ptr());
     AppendMenuW(m, MF_STRING, ID_MANAGE, wide("Manage snippets").as_ptr());
     AppendMenuW(m, MF_STRING, ID_FILE, wide("Open snippets file").as_ptr());
+    AppendMenuW(m, MF_STRING, ID_SHORTCUT, wide("Change shortcut\u{2026}").as_ptr());
     let check = if autostart_enabled() { MF_CHECKED } else { 0 };
     AppendMenuW(m, MF_STRING | check, ID_AUTOSTART, wide("Start with Windows").as_ptr());
     AppendMenuW(m, MF_SEPARATOR, 0, null());
