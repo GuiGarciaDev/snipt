@@ -61,3 +61,8 @@ $w.Flush()
 $dest = Join-Path $PSScriptRoot 'snipt.ico'
 [System.IO.File]::WriteAllBytes($dest, $out.ToArray())
 "wrote $dest ($([math]::Round($out.Length / 1KB, 1)) KB, sizes: $($sizes -join ', '))"
+
+# PNG copy for the README (markdown can't show .ico files).
+$png = Join-Path $PSScriptRoot 'icon.png'
+[System.IO.File]::WriteAllBytes($png, ($images | Where-Object Size -eq 128).Png)
+"wrote $png"

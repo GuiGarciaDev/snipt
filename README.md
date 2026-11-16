@@ -1,13 +1,29 @@
-# Snipt
+<p align="center">
+  <img src="assets/icon.png" width="88" height="88" alt="Snipt icon">
+</p>
 
-A tiny Win+V-style popup for **your own** snippets: text, templates and links.
-Press a shortcut, type a few letters, hit Enter, and the snippet is pasted where you were typing.
+<h1 align="center">Snipt</h1>
+
+<p align="center">
+  <b>A tiny Win+V-style popup for <i>your own</i> snippets: text, templates and links.</b><br>
+  Press a shortcut, type a few letters, hit Enter, and the snippet is pasted where you were typing.
+</p>
+
+<p align="center">
+  <img alt="Windows 10 and 11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0b1d22?logo=windows&logoColor=34D8EA">
+  <img alt="Rust, Win32 and GDI" src="https://img.shields.io/badge/Rust-Win32%20%2B%20GDI-0b1d22?logo=rust&logoColor=34D8EA">
+  <img alt="About 350 KB exe" src="https://img.shields.io/badge/exe-~350%20KB-34D8EA">
+  <img alt="About 2.5 MB of memory" src="https://img.shields.io/badge/RAM-~2.5%20MB-34D8EA">
+  <img alt="0% CPU when idle" src="https://img.shields.io/badge/idle%20CPU-0%25-34D8EA">
+</p>
+
+<p align="center">
+  <img width="447" alt="The Snipt popup: a search field, two pinned links and a template, with keyboard hints in the footer" src="https://github.com/user-attachments/assets/54474855-f6ac-4680-b55a-2314ceb140d4">
+</p>
 
 - **~350 KB** single `.exe`. No installer, no runtime, no web view. Download it and run it.
-- **~2.5 MB** private memory while running.
+- **~2.5 MB** private memory while running, and no CPU at all while it waits in the tray.
 - Pure Rust + Win32 + GDI, with a single dependency (`windows-sys`, plain API bindings). Icons come from the Segoe Fluent Icons font built into Windows.
-
-<img width="447" height="209" alt="image" src="https://github.com/user-attachments/assets/54474855-f6ac-4680-b55a-2314ceb140d4" />
 
 ## Install
 
@@ -27,8 +43,10 @@ That's it. Nothing else to install: the exe is fully standalone (the C runtime i
 
 Right-click the tray icon and check **Start with Windows**. Snipt then starts quietly in the tray each time you sign in. This uses your user's `Run` registry key, so no admin rights are needed, and you can also turn it off in Task Manager > Startup apps. If you later move `snipt.exe` to another folder, just run it once from the new place and the startup entry follows it.
 
-<img width="316" height="168" alt="image" src="https://github.com/user-attachments/assets/81503209-2223-41e5-945a-188bf379b114" />
-
+<p align="center">
+  <img width="316" alt="Tray menu: Open Snipt, Manage snippets, Open snippets file, Change shortcut, Start with Windows and Exit" src="https://github.com/user-attachments/assets/81503209-2223-41e5-945a-188bf379b114"><br>
+  <sub>The tray menu</sub>
+</p>
 
 ### Uninstall
 
@@ -67,12 +85,27 @@ Click the **gear** in the bottom-right corner to switch to manage mode:
 - **Ctrl+P** or the pin icon pins or unpins it.
 - **Esc** or the gear goes back to normal mode.
 
-<img width="435" height="370" alt="image" src="https://github.com/user-attachments/assets/8d13fa6d-1e77-4080-8222-79b10322658a" />
-<img width="435" height="200" alt="image" src="https://github.com/user-attachments/assets/0d57b1cf-351e-4e33-ae12-179c6cd422ba" />
-<img width="441" height="205" alt="image" src="https://github.com/user-attachments/assets/5836d416-54d5-466c-b849-05e21b982a87" />
-\n
+<div align="center">
+  <table>
+    <tr>
+      <td align="center" valign="top">
+        <img width="400" alt="Manage mode: the selected row shows pin, edit and delete buttons" src="https://github.com/user-attachments/assets/0d57b1cf-351e-4e33-ae12-179c6cd422ba"><br>
+        <sub>Manage mode: pin, edit or delete the selected snippet</sub>
+      </td>
+      <td align="center" valign="top">
+        <img width="400" alt="Delete confirmation shown inline in the row, with Cancel and Delete buttons" src="https://github.com/user-attachments/assets/5836d416-54d5-466c-b849-05e21b982a87"><br>
+        <sub>Deleting asks first, right in the row</sub>
+      </td>
+    </tr>
+  </table>
+</div>
 
 The editor has a title, a type (URL, Template or Text) and the content. Template placeholders can be inserted with one click. URLs are validated before saving. The **Pin** toggle next to the type keeps the snippet at the top. Shortcuts in the editor: `Ctrl+Enter` saves, `Tab` switches fields, `Ctrl+T` changes the type, `Ctrl+P` pins, and `Esc` cancels. The editor stays open if you switch to another app, so you can copy text in from elsewhere.
+
+<p align="center">
+  <img width="435" alt="The editor: title, type (URL, Template or Text), pin toggle, content, placeholder chips, and Delete, Cancel and Save buttons" src="https://github.com/user-attachments/assets/8d13fa6d-1e77-4080-8222-79b10322658a"><br>
+  <sub>The editor, with one-click template placeholders</sub>
+</p>
 
 The tray icon menu has **Manage snippets**, **Open snippets file**, **Change shortcut...**, **Start with Windows** and **Exit**.
 
